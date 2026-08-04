@@ -1,0 +1,17 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# 测试输出
+sample/*.png
+!sample/.gitkeep
+
+# macOS
+.DS_Store
+
+# 编辑器
+.vscode/
+.idea/
+*.swp

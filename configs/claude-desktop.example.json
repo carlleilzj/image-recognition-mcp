@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "image-recognition": {
+      "command": "/Users/carllei/WorkBuddy/2026-08-04-13-20-16/image-recognition-mcp/.venv/bin/python",
+      "args": [
+        "/Users/carllei/WorkBuddy/2026-08-04-13-20-16/image-recognition-mcp/mcp_server.py"
+      ]
+    }
+  }
+}

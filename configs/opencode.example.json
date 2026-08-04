@@ -1,0 +1,13 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": {
+    "image-recognition": {
+      "type": "local",
+      "command": [
+        "/Users/carllei/WorkBuddy/2026-08-04-13-20-16/image-recognition-mcp/.venv/bin/python",
+        "/Users/carllei/WorkBuddy/2026-08-04-13-20-16/image-recognition-mcp/mcp_server.py"
+      ],
+      "enabled": true
+    }
+  }
+}
