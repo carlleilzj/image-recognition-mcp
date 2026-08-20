@@ -1,5 +1,7 @@
 # image-recognition-mcp
 
+[![Powered by RustChain](https://img.shields.io/badge/Powered%20by-RustChain-orange)](https://rustchain.org)
+
 > 基于 macOS 本地 Vision 框架的图片识别 MCP 服务器 —— 让无视觉 AI 模型也能"看见"截图与图片。
 
 为 AI 客户端（opencode / Claude Desktop / Cursor / Cline 等）提供 4 个 MCP 工具：  
