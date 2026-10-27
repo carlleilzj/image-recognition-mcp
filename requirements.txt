@@ -1,7 +1,9 @@
 # 图片识别 MCP 服务器 —— Python 依赖
 # 安装：.venv/bin/pip install -r requirements.txt
 
-mcp>=1.2.0                      # MCP 官方 Python SDK（FastMCP）
+# mcp 2.x 才有 mcp.server.mcpserver（1.x 只有 mcp.server.fastmcp）。
+# 服务器代码做了双路径导入，但 1.x 的 FastMCP API 有差异，这里锁 2.x。
+mcp>=2.3.0
 pyobjc-framework-Vision>=10.0   # macOS Vision 框架绑定（OCR / 图像分类）
 pyobjc-framework-Quartz>=10.0   # ImageIO 绑定（图片加载 / 缩略 / 元信息）
 

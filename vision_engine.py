@@ -50,6 +50,49 @@ SUPPORTED_EXTS = {
 
 DATA_URI_RE = re.compile(r"^data:image/[a-zA-Z0-9.+-]+;base64,(.+)$", re.S)
 
+# 解码 data URI 后落盘的临时文件。调用方用完即可清理，避免长期堆积。
+_TEMP_FILES: set[str] = set()
+
+
+def is_temp_file(path: str) -> bool:
+    """该路径是否是本模块解码 data URI 时创建的临时文件。"""
+    return path in _TEMP_FILES
+
+
+def cleanup_temp_files(keep: Optional[set] = None) -> int:
+    """删除本模块创建的全部临时图片文件，返回删除数量。
+
+    `keep` 中的路径会被保留（例如截图，用户可能想留着看）。
+    并发场景请用 `remove_temp_file` 只删本次调用自己的文件。
+    """
+    keep = keep or set()
+    removed = 0
+    for path in list(_TEMP_FILES):
+        if path in keep:
+            continue
+        if remove_temp_file(path):
+            removed += 1
+    return removed
+
+
+def remove_temp_file(path: str) -> bool:
+    """只删除本模块创建的某一个临时文件；不是本模块创建的则不动。"""
+    if path not in _TEMP_FILES:
+        return False
+    _TEMP_FILES.discard(path)
+    try:
+        os.remove(path)
+        return True
+    except OSError:
+        return False
+
+
+def normalize_level(level: Optional[str]) -> str:
+    """把 OCR 档位归一到已知值；未知值回退 accurate，而不是静默用默认常量。"""
+    value = (level or "").strip().lower()
+    return value if value in OCR_LEVELS else "accurate"
+
+
 # ---------------------------------------------------------------------------
 # 噪声过滤（图标/符号误识启发式）
 # ---------------------------------------------------------------------------
@@ -76,7 +119,12 @@ def is_noise_line(text: str, confidence: float, min_conf_single: float = 0.4) ->
       1. 空行
       2. 纯符号行：不含任何 CJK/字母/数字，且长度 >= 2（如 "•••"、"***"）
       3. 特殊符号字符（带圈数字/箭头/几何形状/emoji 等）占整行字符数 >= 60%
-      4. 单字符行且置信度 < min_conf_single（图标常被误识成单个汉字/数字/符号）
+      4. 单字符行、置信度 < min_conf_single，且该字符既不是字母数字也不是汉字
+
+    规则 4 故意只覆盖“非文字”的单字符：图标常被误识成一个标点或怪符号，
+    而单独一个字母/数字/汉字更可能是真内容（答案表、坐标、编号列表）。早期版本
+    对所有低置信度单字符一律判噪声，会把 "B"、"7" 这类真内容误删，且同一张图里
+    "A" 因置信度略高而被保留 —— 行为不可预测。
     """
     t = text.strip()
     if not t:
@@ -91,9 +139,10 @@ def is_noise_line(text: str, confidence: float, min_conf_single: float = 0.4) ->
     if sym_chars > 0 and sym_chars / len(t) >= 0.6:
         return True
 
-    # 规则 4：单字符 + 低置信度
+    # 规则 4：单字符 + 非文字字符 + 低置信度
     if len(t) == 1 and confidence < min_conf_single:
-        return True
+        if not _ALNUM_RE.search(t) and not _CJK_RE.search(t):
+            return True
 
     return False
 
@@ -152,19 +201,48 @@ def image_info(path: str) -> dict:
     return info
 
 
-def _write_temp(data: bytes, prefix: str = "wb_mcp_img_") -> str:
-    """把二进制数据写入临时文件，返回路径。"""
-    fd, path = tempfile.mkstemp(prefix=prefix, suffix=".png")
+def _write_temp(data: bytes, prefix: str = "wb_mcp_img_", suffix: str = ".png") -> str:
+    """把二进制数据写入临时文件，返回路径；登记以便后续清理。"""
+    fd, path = tempfile.mkstemp(prefix=prefix, suffix=suffix)
     with os.fdopen(fd, "wb") as f:
         f.write(data)
+    _TEMP_FILES.add(path)
     return path
+
+
+# 常见图片魔数 → 扩展名，用于给 data URI 落盘时选对后缀
+_MAGIC_SUFFIX = (
+    (b"\x89PNG\r\n\x1a\n", ".png"),
+    (b"\xff\xd8\xff", ".jpg"),
+    (b"GIF87a", ".gif"),
+    (b"GIF89a", ".gif"),
+    (b"BM", ".bmp"),
+    (b"II*\x00", ".tiff"),
+    (b"MM\x00*", ".tiff"),
+)
+
+
+def _suffix_for(data: bytes) -> str:
+    for magic, suffix in _MAGIC_SUFFIX:
+        if data.startswith(magic):
+            return suffix
+    # HEIC/HEIF/WebP: 看容器内标识
+    if len(data) > 12 and data[4:8] == b"ftyp":
+        brand = data[8:12]
+        if brand in (b"heic", b"heix", b"hevc", b"heim", b"heis", b"mif1", b"msf1"):
+            return ".heic"
+        if brand == b"avif":
+            return ".avif"
+    if len(data) > 12 and data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return ".webp"
+    return ".png"
 
 
 def resolve_image_source(source: str, workdir: Optional[str] = None) -> str:
     """把「本地路径 / data URI / 纯 base64」统一解析为本地文件路径。
 
-    - data:image/png;base64,xxxx  → 解码写入临时文件
-    - 极长且以 PNG 魔数开头的裸 base64 → 兜底解码
+    - data:image/...;base64,xxxx  → 解码写入临时文件（按魔数选后缀）
+    - 极长裸 base64               → 按魔数兜底解码（PNG/JPEG/GIF/BMP/TIFF/WebP）
     - 相对路径 → 基于 workdir（默认当前目录）解析
     - 绝对路径 → 直接校验存在性
     """
@@ -178,16 +256,21 @@ def resolve_image_source(source: str, workdir: Optional[str] = None) -> str:
             raw = base64.b64decode(m.group(1))
         except Exception as exc:
             raise ValueError(f"data URI base64 解码失败: {exc}") from exc
-        return _write_temp(raw)
+        if not raw:
+            raise ValueError("data URI 解码结果为空")
+        return _write_temp(raw, suffix=_suffix_for(raw))
 
-    # 纯 base64 兜底：长度足够且是 PNG 魔数，避免误伤普通路径
+    # 纯 base64 兜底：长度足够且魔数可识别，避免误伤普通路径
     if len(source) > 200 and not source.startswith("/"):
         try:
             raw = base64.b64decode(source, validate=True)
         except Exception:
             raw = None
-        if raw and raw[:8] == b"\x89PNG\r\n\x1a\n":
-            return _write_temp(raw)
+        if raw:
+            suffix = _suffix_for(raw)
+            known = any(raw.startswith(magic) for magic, _ in _MAGIC_SUFFIX) or suffix != ".png"
+            if known:
+                return _write_temp(raw, suffix=suffix)
 
     if not source.startswith("/"):
         base = workdir or os.getcwd()
@@ -204,6 +287,85 @@ def resolve_image_source(source: str, workdir: Optional[str] = None) -> str:
 # ---------------------------------------------------------------------------
 # OCR：文字识别
 # ---------------------------------------------------------------------------
+
+def order_lines(lines: list[dict], column_gap: float = 0.04) -> list[dict]:
+    """把 OCR 行排成人类阅读顺序，并处理多栏排版。
+
+    单纯的 `(-y, x)` 排序只解决单栏：两栏布局会左右交错（LEFT-1, RIGHT-1,
+    LEFT-2, ...），拼出的全文不可读且不报错。这里先按纵向重叠把行分成「行带」，
+    再判断整页是否是多栏：
+
+    1. 估算行高，把 y 相近的行归入同一行带；
+    2. 找一条纵向空白带：所有行带的 x 区间都在该处断开，且两侧都有内容；
+    3. 若存在这样的分割（并满足最小栏宽），就按「先左栏到底，再右栏到底」输出；
+    4. 否则退回单栏的按行带顺序。
+
+    `column_gap` 是判定栏间空白的最小宽度（归一化坐标），默认 4%。
+    """
+    if not lines:
+        return []
+
+    ordered = sorted(lines, key=lambda l: (-l["bbox"]["y"], l["bbox"]["x"]))
+    heights = [l["bbox"]["height"] for l in ordered if l["bbox"]["height"] > 0]
+    line_h = max(sum(heights) / len(heights), 0.008) if heights else 0.02
+
+    # 1. 归入行带：y 中心落在同一带内视为一行
+    bands: list[list[dict]] = []
+    for line in ordered:
+        cy = line["bbox"]["y"] + line["bbox"]["height"] / 2
+        if bands:
+            last = bands[-1]
+            last_cy = sum(
+                b["bbox"]["y"] + b["bbox"]["height"] / 2 for b in last
+            ) / len(last)
+            if abs(cy - last_cy) <= line_h * 0.6:
+                last.append(line)
+                continue
+        bands.append([line])
+
+    for band in bands:
+        band.sort(key=lambda l: l["bbox"]["x"])
+
+    # 2. 找纵向空白带：候选点来自各行带的左右边界
+    def find_split() -> Optional[float]:
+        edges = set()
+        for band in bands:
+            for line in band:
+                b = line["bbox"]
+                edges.add(round(b["x"], 4))
+                edges.add(round(b["x"] + b["width"], 4))
+        candidates = sorted(edges)
+        best = None
+        for cut in candidates:
+            left = [l for band in bands for l in band if l["bbox"]["x"] + l["bbox"]["width"] <= cut + 1e-6]
+            right = [l for band in bands for l in band if l["bbox"]["x"] >= cut - 1e-6]
+            spanning = [l for band in bands for l in band
+                        if l["bbox"]["x"] < cut - 1e-6 and l["bbox"]["x"] + l["bbox"]["width"] > cut + 1e-6]
+            # 没有横跨分割线的行，且两侧都有内容
+            if spanning or not left or not right:
+                continue
+            left_edge = min(l["bbox"]["x"] for l in left)
+            right_edge = max(l["bbox"]["x"] + l["bbox"]["width"] for l in left)
+            right_start = min(l["bbox"]["x"] for l in right)
+            right_far = max(l["bbox"]["x"] + l["bbox"]["width"] for l in right)
+            # 栏间空白足够宽，且两侧各自成栏（不是同一行的两段）
+            if right_start - right_edge >= column_gap:
+                # 要求两侧宽度相近，避免把「标题 + 右对齐页码」误判成两栏
+                lw = right_edge - left_edge
+                rw = right_far - right_start
+                if lw > 0 and rw > 0 and min(lw, rw) / max(lw, rw) >= 0.25:
+                    best = cut
+        return best
+
+    cut = find_split()
+    if cut is None:
+        return [l for band in bands for l in band]
+
+    # 3. 多栏：先左栏按行带输出，再右栏
+    left_lines = [l for band in bands for l in band if l["bbox"]["x"] + l["bbox"]["width"] <= cut + 1e-6]
+    right_lines = [l for band in bands for l in band if l["bbox"]["x"] >= cut - 1e-6]
+    return left_lines + right_lines
+
 
 def ocr_image(
     path: str,
@@ -222,7 +384,7 @@ def ocr_image(
     cg = _load_cg_image(path, max_pixel)
 
     request = Vision.VNRecognizeTextRequest.alloc().init()
-    request.setRecognitionLevel_(OCR_LEVELS.get(level, Vision.VNRequestTextRecognitionLevelAccurate))
+    request.setRecognitionLevel_(OCR_LEVELS.get(normalize_level(level), Vision.VNRequestTextRecognitionLevelAccurate))
     request.setUsesLanguageCorrection_(True)
     request.setRecognitionLanguages_(languages or DEFAULT_LANGUAGES)
 
@@ -253,9 +415,7 @@ def ocr_image(
             },
         })
 
-    # 按阅读顺序：先按行（y 从底部起算，取反即从上到下），同行内再按 x
-    lines.sort(key=lambda l: (-l["bbox"]["y"], l["bbox"]["x"]))
-    return lines
+    return order_lines(lines)
 
 
 # ---------------------------------------------------------------------------
@@ -267,12 +427,17 @@ def classify_image(
     top_k: int = 8,
     min_confidence: float = 0.05,
     max_pixel: Optional[int] = MAX_PIXEL_DEFAULT,
+    dedupe: bool = True,
 ) -> list[dict]:
     """识别图像主体/场景（VNClassifyImageRequest）。
 
     返回按置信度降序的标签列表：[{label, confidence}, ...]
     label 形如 "Animal", "Food", "Landscape", "Vehicle" 等（英文，由模型自行理解）。
     自动过滤 negative 类目。
+
+    `dedupe` 为真时，把置信度几乎相同的标签视为同一个判定结果，只保留最具信息量
+    的那一个：Vision 对同一条视觉线索常同时给出多个同分标签（如
+    recreation / sport / ping_pong 全是 0.686），逐个列出会误导模型以为有多个主体。
     """
     cg = _load_cg_image(path, max_pixel)
 
@@ -293,6 +458,16 @@ def classify_image(
         items.append({"label": ident, "confidence": round(conf, 3)})
 
     items.sort(key=lambda r: -r["confidence"])
+
+    if dedupe:
+        kept: list[dict] = []
+        for item in items:
+            # 与已保留项置信度几乎相同 → 同一判定结果的不同叫法
+            if any(abs(item["confidence"] - k["confidence"]) < 1e-3 for k in kept):
+                continue
+            kept.append(item)
+        items = kept
+
     return items[:top_k]
 
 
@@ -304,10 +479,11 @@ def analyze_image(
     path: str,
     languages: Optional[list] = None,
     max_pixel: Optional[int] = MAX_PIXEL_DEFAULT,
+    level: str = "accurate",
 ) -> dict:
     """一站式识别：图像信息 + OCR 全文 + 主体/场景分类 + 可读摘要。"""
     started = time.time()
-    ocr_lines = ocr_image(path, languages=languages, max_pixel=max_pixel)
+    ocr_lines = ocr_image(path, languages=languages, level=level, max_pixel=max_pixel)
     classes = classify_image(path, max_pixel=max_pixel)
 
     full_text = "\n".join(l["text"] for l in ocr_lines)

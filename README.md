@@ -128,15 +128,26 @@ pip install -r requirements.txt
   "image": "/Users/me/Pictures/shot.png",      // 必填，路径 / data URI / 纯 base64
   "languages": "zh-Hans,en-US",                // 可选，逗号分隔，顺序即优先级
   "min_confidence": 0.2,                       // 可选，0~1，过滤低置信度结果
-  "filter_noise": true                         // 可选，默认 true，过滤图标/符号误识噪声
+  "filter_noise": true,                        // 可选，默认 true，过滤图标/符号误识噪声
+  "level": "accurate",                         // 可选，accurate(默认) 或 fast
+  "include_bbox": false                        // 可选，默认 false，是否返回坐标
 }
 ```
 
-> **filter_noise 说明**：自动过滤截图中的图标误识噪声（如 `•••`、`③`、单独一个 `8`/`凸` 等），
-> 但**保留可能有业务含义的数字串**（金额、卡号、交易编号、时间等）。被过滤的行会单独放在
-> 返回的 `noise` 字段中，不丢失信息；如需原始全量结果，设 `filter_noise: false`。
+> **filter_noise 说明**：自动过滤截图中的图标误识噪声（如 `•••`、`③`、`■` 等），
+> 但**保留可能有业务含义的数字串**（金额、卡号、交易编号、时间等），也保留单独的字母/数字/汉字
+> （答案表、坐标、编号列表）。被过滤的行会单独放在 `noise` 字段中，不丢失信息；
+> 如需原始全量结果，设 `filter_noise: false`。
 
-**返回**：
+> **include_bbox 说明**：每行的 `confidence` 与 `bbox` 只在 `include_bbox: true` 时返回。
+> 默认关闭，因为坐标通常用不到，却占返回体积的约九成（实测一张 1080p 截图：
+> 21,992 → 4,941 字符，-78%）。
+
+> **level 说明**：`fast` 约快 4 倍，但**中文准确率明显下降** —— 实测小字中文会变成乱码
+> （`图片识别测试` → `a ki/iyilJ jJf,Iil`），1080p 截图字符重合率仅约 37%、漏掉两成行。
+> 只建议用于大号清晰英文或快速预览，中文场景请保持默认 `accurate`。
+
+**返回**（`include_bbox: false`）：
 
 ```json
 {
@@ -144,22 +155,32 @@ pip install -r requirements.txt
   "image": "/Users/me/Pictures/shot.png",
   "text": "完整拼接的全文",
   "count": 3,
-  "lines": [
-    {
-      "text": "MacBook Air 图片识别测试",
-      "confidence": 0.5,
-      "bbox": {"x": 0.052, "y": 0.695, "width": 0.555, "height": 0.133}
-    }
-  ]
+  "lines": [{"text": "MacBook Air 图片识别测试"}]
 }
 ```
+
+`include_bbox: true` 时 `lines` 恢复为完整结构：
+
+```json
+{
+  "text": "MacBook Air 图片识别测试",
+  "confidence": 0.5,
+  "bbox": {"x": 0.052, "y": 0.695, "width": 0.555, "height": 0.133}
+}
+```
+
+> `bbox` 为归一化坐标，原点在左下角。**多栏排版**（两栏正文、侧边栏+正文、表格）
+> 会自动按「读完左栏再读右栏」输出，不会左右交错。
 
 ### 2. `recognize_image` — 综合识别
 
 ```json
 {
   "image": "/path/to/img.png",
-  "languages": "zh-Hans,en-US"
+  "languages": "zh-Hans,en-US",
+  "filter_noise": true,
+  "level": "accurate",
+  "include_bbox": false
 }
 ```
 
@@ -170,7 +191,7 @@ pip install -r requirements.txt
   "status": "ok",
   "image": "/path/to/img.png",
   "info": {"path": "...", "size_bytes": 12345, "pixel_width": 1200, "pixel_height": 420, "uti": "public.png"},
-  "ocr": [...],
+  "ocr": [{"text": "..."}],
   "classification": [{"label": "document", "confidence": 0.529}, ...],
   "summary": "图中文字(OCR):\n... \n图像主体/场景: document(0.53)",
   "elapsed_ms": 98
@@ -183,7 +204,8 @@ pip install -r requirements.txt
 {
   "image": "/path/to/img.png",
   "top_k": 8,                    // 1~20
-  "min_confidence": 0.05
+  "min_confidence": 0.05,
+  "dedupe": true                 // 默认 true，合并同分标签
 }
 ```
 
@@ -201,12 +223,19 @@ pip install -r requirements.txt
 ```
 
 > label 为英文（如 Animal / Landscape / Food / Vehicle），由调用方模型自行理解并翻译。
+>
+> **dedupe 说明**：Vision 对同一条视觉线索常同时给出多个同分标签（例如对纯文字图
+> `recreation` / `sport` / `ping_pong` 全是 0.686）。默认把它们视为同一个判定结果只留一个，
+> 避免模型误以为有多个主体；`dedupe: false` 返回原始全集。
 
 ### 4. `screenshot_and_recognize` — 截屏并识别
 
 ```json
 {
-  "languages": "zh-Hans,en-US"
+  "languages": "zh-Hans,en-US",
+  "filter_noise": true,
+  "level": "accurate",
+  "include_bbox": false
 }
 ```
 
@@ -278,25 +307,32 @@ MCP 采用「工具由模型按需调用」的协议设计，**服务器无法�
 
 ### opencode
 
-写入 `opencode.json`（项目级）或 `~/.config/opencode/opencode.json`（用户级）：
+写入 `~/.config/opencode/opencode.json`（用户级，所有项目可用）。
+
+> **注意版本**：OpenCode **V2** 要求服务器放在 `mcp.servers` 下，开关字段是 `disabled`
+> （不是 `enabled`）。下面这份是 V2 格式；V1 的 `mcp.<name>` + `enabled` 写法在 V2 下不生效。
 
 ```json
 {
   "$schema": "https://opencode.ai/config.json",
   "mcp": {
-    "image-recognition": {
-      "type": "local",
-      "command": [
-        "/path/to/image-recognition-mcp/.venv/bin/python",
-        "/path/to/image-recognition-mcp/mcp_server.py"
-      ],
-      "enabled": true
+    "servers": {
+      "image-recognition": {
+        "type": "local",
+        "command": [
+          "/path/to/image-recognition-mcp/.venv/bin/python",
+          "/path/to/image-recognition-mcp/mcp_server.py"
+        ],
+        "cwd": "/path/to/image-recognition-mcp"
+      }
     }
   }
 }
 ```
 
-重启 opencode 即可在工具列表中看到 `image-recognition` 的 4 个工具。
+写入后无需重启即可看到 4 个工具（配置文件会被监视并自动重载）。
+**改过 `mcp_server.py` 之后必须重启后台服务**（`opencode service restart`），
+MCP 服务器是常驻进程，不会热重载代码。
 
 ### Claude Desktop
 
@@ -328,9 +364,9 @@ MCP 采用「工具由模型按需调用」的协议设计，**服务器无法�
 
 ### WorkBuddy
 
-编辑 `~/.workbuddy/mcp.json`，将 `image-recognition` 加入 `mcpServers`，重启后生效：
+编辑 `~/.workbuddy/mcp.json`，将 `image-recognition` 加入 `mcpServers`，重启后生效。
 
-### WorkBuddy
+### 更多示例
 
 参考配置示例见 `configs/` 目录：
 
@@ -342,10 +378,10 @@ MCP 采用「工具由模型按需调用」的协议设计，**服务器无法�
 
 ## 性能与资源
 
-| 图片大小            | OCR 耗时（实测 M4 Air）         | 内存峰值    |
+| 图片大小            | OCR 耗时（accurate，实测 M4 Air）  | 内存峰值    |
 | --------------- | ------------------------- | ------- |
-| 1200×420 (测试图)  | ~100 ms                   | < 50 MB |
-| 1920×1080 (截图)  | 150–300 ms                | ~80 MB  |
+| 1200×420 (测试图)  | ~70 ms                    | < 50 MB |
+| 1920×1080 (截图)  | 300–550 ms                | ~80 MB  |
 | 4096×4096 (4K)  | 400–800 ms                | ~150 MB |
 | 8000×8000 (超大图) | 自动缩到 4096px，约 500–1200 ms | ~200 MB |
 
@@ -353,7 +389,10 @@ MCP 采用「工具由模型按需调用」的协议设计，**服务器无法�
 
 - 已在 `_load_cg_image` 内置 4096px 自动缩略，对绝大多数截图已足够。
 - 若识别大量批量图片，可在客户端对多次 `ocr_image` 调用合并为一次 `recognize_image`，减少上下文 token 消耗。
-- OCR 选 `level="fast"` 可提速 30–50%，代价是准确率略降（小字、手写体）。
+- 保持 `include_bbox: false`（默认）：坐标占返回体积约九成，实测一张 1080p 截图
+  21,992 → 4,941 字符（-78%），识别文本完全一致。
+- `level="fast"` 约快 4 倍，但**中文准确率明显下降**：实测 1200×420 小字中文会变成乱码、
+  1080p 截图字符重合率仅约 37%。仅建议用于大号清晰英文或快速预览。
 
 ---
 
